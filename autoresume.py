@@ -530,8 +530,88 @@ def cmd_uninstall():
     return 0
 
 
-def main(argv=None) -> int:
+USAGE = """\
+claude-auto-resume — resume usage-limited Claude Code sessions in cmux
+
+usage: claude-auto-resume <command>
+
+  install       wire the hooks into Claude Code's settings.json
+  uninstall     remove exactly what install added, nothing else
+  status        show pending sessions and whether the waiter is alive
+  nudge <sid>   try to resume one pending session right now
+  wait          run the waiter loop in the foreground (debugging)
+
+internal commands invoked by Claude Code hooks:
+  hook-stop-failure, hook-stop
+"""
+
+
+def waiter_is_running():
+    """A waiter holds an exclusive flock for its whole life, so 'can we
+    take the lock' is the liveness check — no pidfiles to go stale."""
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(d / "waiter.lock", "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+
+
+def cmd_status():
+    print(f"waiter: {'running' if waiter_is_running() else 'not running'}")
+    with locked_state() as entries:
+        snapshot = list(entries.values())
+    if not snapshot:
+        print("nothing pending")
+        return 0
+    for e in snapshot:
+        print(f"{e['session_id']}  attempts={e['attempts']}  "
+              f"reset_at={e['reset_at'] or '?'}  "
+              f"next={e['next_attempt_at']}  "
+              f"pane={e['surface_id'] or '-'}")
     return 0
+
+
+def cmd_nudge(sid):
+    with locked_state() as entries:
+        entry = entries.get(sid)
+    if entry is None:
+        print(f"no pending entry for {sid}", file=sys.stderr)
+        return 1
+    outcome = nudge_entry(entry)
+    print(outcome)
+    if outcome == "resumed":
+        with locked_state() as entries:
+            entries.pop(sid, None)
+        return 0
+    return 1
+
+
+def main(argv=None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in ("help", "-h", "--help"):
+        print(USAGE)
+        return 0
+    cmd, rest = args[0], args[1:]
+    if cmd == "hook-stop-failure":
+        return cmd_hook_stop_failure(sys.stdin.read())
+    if cmd == "hook-stop":
+        return cmd_hook_stop(sys.stdin.read())
+    if cmd == "wait":
+        return cmd_wait()
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "nudge" and len(rest) == 1:
+        return cmd_nudge(rest[0])
+    if cmd == "install":
+        return cmd_install()
+    if cmd == "uninstall":
+        return cmd_uninstall()
+    print(USAGE, file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
