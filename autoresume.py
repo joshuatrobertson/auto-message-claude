@@ -7,6 +7,7 @@ continue message into the original cmux pane. Design rationale lives in
 docs/superpowers/specs/2026-07-05-auto-resume-design.md.
 """
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,6 +22,10 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+RESET_BUFFER = timedelta(minutes=2)
+RETRY_BACKOFF = timedelta(minutes=10)
+LADDER = [timedelta(hours=1), timedelta(hours=3), timedelta(hours=5)]
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday",
             "friday", "saturday", "sunday"]
@@ -143,6 +148,96 @@ def locked_state():
             tmp.rename(path)
         finally:
             fcntl.flock(lockf, fcntl.LOCK_UN)
+
+
+def next_attempt_time(entry, now):
+    """When to (re)try this entry.
+
+    Known reset time: first attempt fires just after it; later attempts back
+    off 10 minutes. Unknown reset time: a ladder anchored at detection —
+    +1h/+3h/+5h covers the whole 5-hour window worst case.
+    """
+    if entry.get("reset_at"):
+        if entry["attempts"] == 0:
+            return from_iso(entry["reset_at"]) + RESET_BUFFER
+        return now + RETRY_BACKOFF
+    rung = min(entry["attempts"], len(LADDER) - 1)
+    return from_iso(entry["detected_at"]) + LADDER[rung]
+
+
+def spawn_waiter():
+    """Fire-and-forget the waiter. It self-elects via flock (Task 7), so
+    spawning duplicates is harmless — the losers exit immediately."""
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "log", "a") as out:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "wait"],
+            stdout=out, stderr=out, stdin=subprocess.DEVNULL,
+            start_new_session=True)
+
+
+def cmd_hook_stop_failure(stdin_text, env=os.environ, now=None, spawn=None):
+    """StopFailure(rate_limit) hook body. Must never raise, must exit 0."""
+    try:
+        now = now or datetime.now().astimezone()
+        payload = json.loads(stdin_text)
+        sid = payload["session_id"]
+
+        # Archive the raw payload: these captures are how the parser's test
+        # fixtures get refreshed when Anthropic changes the error format.
+        cap = state_dir() / "captures"
+        cap.mkdir(parents=True, exist_ok=True)
+        stamp = now.strftime("%Y%m%dT%H%M%S")
+        (cap / f"{stamp}-{sid[:8]}.json").write_text(stdin_text)
+
+        error_text = " ".join(
+            str(payload.get(k, "")) for k in ("error", "error_details"))
+        reset_at = parse_reset_at(error_text, now)
+
+        with locked_state() as entries:
+            prev = entries.get(sid, {})
+            entry = {
+                "session_id": sid,
+                "transcript_path": payload.get("transcript_path"),
+                "cwd": payload.get("cwd"),
+                "surface_id": env.get("CMUX_SURFACE_ID"),
+                "workspace_id": env.get("CMUX_WORKSPACE_ID"),
+                "detected_at": prev.get("detected_at", iso(now)),
+                "reset_at": iso(reset_at) if reset_at else None,
+                # Preserved across re-upserts: a nudge that lands before the
+                # limit actually reset re-fires this hook, and resetting the
+                # counter would make that loop immortal.
+                "attempts": prev.get("attempts", 0),
+            }
+            entry["next_attempt_at"] = iso(next_attempt_time(entry, now))
+            entries[sid] = entry
+
+        log(f"limit hit: session {sid} reset_at={entry['reset_at']} "
+            f"next={entry['next_attempt_at']}")
+        (spawn or spawn_waiter)()
+    except Exception as exc:  # a hook must never break the Claude session
+        try:
+            log(f"hook error (stop-failure): {exc!r}")
+        except Exception:
+            pass
+    return 0
+
+
+def cmd_hook_stop(stdin_text):
+    """Stop hook body: the session ended a turn normally, so any pending
+    nudge for it is stale (finished, or resumed by hand). Drop it."""
+    try:
+        sid = json.loads(stdin_text).get("session_id")
+        with locked_state() as entries:
+            if entries.pop(sid, None) is not None:
+                log(f"cleared pending nudge for {sid} (session progressed)")
+    except Exception as exc:
+        try:
+            log(f"hook error (stop): {exc!r}")
+        except Exception:
+            pass
+    return 0
 
 
 def main(argv=None) -> int:
