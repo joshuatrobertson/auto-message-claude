@@ -67,3 +67,23 @@ class TestParseResetAt(unittest.TestCase):
     def test_result_is_tz_aware(self):
         got = autoresume.parse_reset_at("resets at 6pm", NOW)
         self.assertIsNotNone(got.tzinfo)
+
+    def test_malformed_iso_falls_through_to_none(self):
+        # Matches the ISO regex shape but is not a real date: must not raise.
+        self.assertIsNone(autoresume.parse_reset_at(
+            "resets at 2026-99-99T25:99:00Z", NOW))
+
+    def test_weekday_same_day_future_time_stays_today(self):
+        # "Sunday at 2pm" when it's Sunday 13:00 → today at 14:00.
+        got = autoresume.parse_reset_at("resets Sunday at 2pm", NOW)
+        self.assertEqual(got, datetime(2026, 7, 5, 14, 0, tzinfo=CHI))
+
+    def test_real_world_session_limit_string(self):
+        # Captured verbatim from a live limit event, 2026-07-05. NOW is
+        # 13:00 Chicago = 19:00 London, so 6:10pm London has passed and
+        # rolls to the next day.
+        got = autoresume.parse_reset_at(
+            "You've hit your session limit · resets 6:10pm (Europe/London)",
+            NOW)
+        self.assertEqual(got, datetime(2026, 7, 6, 18, 10,
+                                       tzinfo=ZoneInfo("Europe/London")))

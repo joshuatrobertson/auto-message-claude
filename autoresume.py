@@ -49,11 +49,14 @@ def parse_reset_at(text, now):
 
     m = _ISO_RE.search(text)
     if m:
-        raw = m.group(0).replace(" ", "T").replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(raw)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=now.tzinfo)
-        return parsed
+        try:
+            raw = m.group(0).replace(" ", "T").replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=now.tzinfo)
+            return parsed
+        except ValueError:
+            pass  # shaped like a date, isn't one — try the other formats
 
     m = _PROSE_RE.search(text)
     if m:
