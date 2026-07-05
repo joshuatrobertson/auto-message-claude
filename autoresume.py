@@ -377,7 +377,7 @@ def cmd_wait(tick=60, sleep=time.sleep, now_fn=None, nudge=nudge_entry):
     now_fn = now_fn or (lambda: datetime.now().astimezone())
     d = state_dir()
     d.mkdir(parents=True, exist_ok=True)
-    lockf = open(d / "waiter.lock", "w")
+    lockf = open(d / "waiter.lock", "a")
     try:
         fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -552,7 +552,7 @@ def waiter_is_running():
     d = state_dir()
     d.mkdir(parents=True, exist_ok=True)
     try:
-        with open(d / "waiter.lock", "w") as f:
+        with open(d / "waiter.lock", "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(f, fcntl.LOCK_UN)
         return False

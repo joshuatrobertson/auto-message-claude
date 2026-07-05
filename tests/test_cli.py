@@ -64,3 +64,15 @@ class TestCli(TempStateMixin, unittest.TestCase):
         self.assertEqual(rc, 0)
         with autoresume.locked_state() as s:
             self.assertEqual(s, {})
+
+    def test_nudge_resumed_returns_zero_and_pops(self):
+        with autoresume.locked_state() as s:
+            s["sess-ok"] = {"session_id": "sess-ok", "attempts": 0}
+        real = autoresume.nudge_entry
+        autoresume.nudge_entry = lambda entry, **kw: "resumed"
+        self.addCleanup(setattr, autoresume, "nudge_entry", real)
+        rc, out, _ = run_main("nudge", "sess-ok")
+        self.assertEqual(rc, 0)
+        self.assertIn("resumed", out)
+        with autoresume.locked_state() as s:
+            self.assertNotIn("sess-ok", s)
