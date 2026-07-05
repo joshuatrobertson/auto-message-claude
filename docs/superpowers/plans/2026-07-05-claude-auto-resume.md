@@ -6,7 +6,7 @@
 
 **Architecture:** A Claude Code `StopFailure` hook upserts an entry into a JSON state file and spawns a detached waiter. The waiter (a flock-elected singleton) sleeps in 60s ticks and, when an entry comes due, nudges the pane via the `cmux` CLI, verifying success by finding a new assistant message in the session's transcript JSONL. Spec: `docs/superpowers/specs/2026-07-05-auto-resume-design.md`.
 
-**Tech Stack:** Python 3.9+ stdlib only (`json`, `re`, `fcntl`, `subprocess`, `datetime`, `zoneinfo`, `argparse`, `unittest`). External commands: `cmux`, `claude`, `osascript` — all faked in tests via a temp dir prepended to `PATH`.
+**Tech Stack:** Python 3.9+ stdlib only (`json`, `re`, `fcntl`, `subprocess`, `datetime`, `zoneinfo`, `unittest`). CLI dispatch is a plain if-chain, not argparse — exit codes stay explicit and testable. External commands: `cmux`, `claude`, `osascript` — all faked in tests via a temp dir prepended to `PATH`.
 
 ## Global Constraints
 
@@ -32,6 +32,7 @@ tests/test_pane.py               # cmux wrapper, pane classifier, transcript che
 tests/test_nudge.py              # nudge decision flow against a fake cmux
 tests/test_waiter.py             # waiter loop with injected clock/sleep
 tests/test_install.py            # settings.json merge / manifest / uninstall
+tests/test_cli.py                # main() dispatch, status output, manual nudge
 tests/helpers.py                 # temp state dir + fake-bin scaffolding shared by tests
 README.md                        # Task 10
 docs/superpowers/{specs,plans}/  # this document and the spec
@@ -1198,3 +1199,837 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
 
 ---
+
+### Task 7: The waiter loop
+
+**Files:**
+- Modify: `autoresume.py`
+- Create: `tests/test_waiter.py`
+
+**Interfaces:**
+- Consumes: `locked_state`, `next_attempt_time`, `nudge_entry`, `notify`, `MAX_ATTEMPTS`, `from_iso`/`iso`.
+- Produces: `cmd_wait(tick=60, sleep=time.sleep, now_fn=None, nudge=nudge_entry) -> int`. Flock-elected singleton; exits 0 when state is empty or another waiter holds the lock. All parameters exist for test injection — production callers pass nothing.
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/test_waiter.py`:
+
+```python
+import fcntl
+import unittest
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import autoresume
+from tests.helpers import TempStateMixin
+
+T0 = datetime(2026, 7, 5, 13, 0, tzinfo=ZoneInfo("America/Chicago"))
+
+
+class Clock:
+    """Injected clock: sleep() just advances now()."""
+    def __init__(self, start):
+        self.t = start
+        self.sleeps = 0
+
+    def now(self):
+        return self.t
+
+    def sleep(self, secs):
+        self.t += timedelta(seconds=secs)
+        self.sleeps += 1
+        if self.sleeps > 10000:
+            raise AssertionError("waiter never exited")
+
+
+def entry(sid="sess-1", reset_at=None, attempts=0, due=T0):
+    return {
+        "session_id": sid, "transcript_path": "/tmp/t.jsonl",
+        "cwd": "/tmp", "surface_id": "surf-9", "workspace_id": "ws-2",
+        "detected_at": autoresume.iso(T0 - timedelta(minutes=5)),
+        "reset_at": autoresume.iso(reset_at) if reset_at else None,
+        "attempts": attempts, "next_attempt_at": autoresume.iso(due),
+    }
+
+
+def put(*entries_):
+    with autoresume.locked_state() as s:
+        for e in entries_:
+            s[e["session_id"]] = e
+
+
+def run_waiter(clock, outcomes):
+    """outcomes: list consumed one per nudge call; records what got nudged."""
+    nudged = []
+
+    def fake_nudge(e, **kw):
+        nudged.append((e["session_id"], e["attempts"]))
+        return outcomes.pop(0)
+
+    rc = autoresume.cmd_wait(tick=60, sleep=clock.sleep,
+                             now_fn=clock.now, nudge=fake_nudge)
+    return rc, nudged
+
+
+class TestWaiter(TempStateMixin, unittest.TestCase):
+    def test_empty_state_exits_immediately(self):
+        clock = Clock(T0)
+        rc, nudged = run_waiter(clock, [])
+        self.assertEqual(rc, 0)
+        self.assertEqual(nudged, [])
+
+    def test_due_entry_resumed_and_removed(self):
+        put(entry(due=T0))
+        clock = Clock(T0)
+        rc, nudged = run_waiter(clock, ["resumed"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(nudged, [("sess-1", 0)])
+        with autoresume.locked_state() as s:
+            self.assertEqual(s, {})
+        self.assertIn("Resumed", (self.state / "log").read_text())
+
+    def test_not_due_yet_waits_for_its_time(self):
+        put(entry(due=T0 + timedelta(minutes=30)))
+        clock = Clock(T0)
+        rc, nudged = run_waiter(clock, ["resumed"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(nudged), 1)
+        # 30 minutes of 60s ticks had to pass first.
+        self.assertGreaterEqual(clock.sleeps, 30)
+
+    def test_retry_backs_off_then_gives_up_at_max(self):
+        put(entry(reset_at=T0, due=T0, attempts=0))
+        clock = Clock(T0)
+        rc, nudged = run_waiter(clock, ["retry", "retry", "retry"])
+        self.assertEqual(rc, 0)
+        # attempts seen by each nudge: 0, then 1, then 2 — then removal.
+        self.assertEqual(nudged, [("sess-1", 0), ("sess-1", 1), ("sess-1", 2)])
+        with autoresume.locked_state() as s:
+            self.assertEqual(s, {})
+        self.assertIn("gave up", (self.state / "log").read_text())
+
+    def test_dead_pane_is_removed_with_notification(self):
+        put(entry(due=T0))
+        clock = Clock(T0)
+        rc, nudged = run_waiter(clock, ["dead_pane"])
+        self.assertEqual(rc, 0)
+        with autoresume.locked_state() as s:
+            self.assertEqual(s, {})
+        self.assertIn("by hand", (self.state / "log").read_text())
+
+    def test_two_sessions_processed_independently(self):
+        put(entry(sid="a", due=T0), entry(sid="b", due=T0))
+        clock = Clock(T0)
+        rc, nudged = run_waiter(clock, ["resumed", "resumed"])
+        self.assertEqual(sorted(n[0] for n in nudged), ["a", "b"])
+
+    def test_entry_cleared_mid_nudge_stays_cleared(self):
+        # The Stop hook can remove an entry while a nudge is in flight
+        # (user resumed by hand). The waiter must not resurrect it.
+        put(entry(due=T0))
+        clock = Clock(T0)
+
+        def clearing_nudge(e, **kw):
+            with autoresume.locked_state() as s:
+                s.pop("sess-1", None)
+            return "retry"
+
+        rc = autoresume.cmd_wait(tick=60, sleep=clock.sleep,
+                                 now_fn=clock.now, nudge=clearing_nudge)
+        self.assertEqual(rc, 0)
+        with autoresume.locked_state() as s:
+            self.assertEqual(s, {})
+
+    def test_singleton_second_waiter_exits_at_once(self):
+        put(entry(due=T0 + timedelta(hours=1)))
+        lockf = open(self.state / "waiter.lock", "w")
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            clock = Clock(T0)
+            rc, nudged = run_waiter(clock, [])
+            self.assertEqual(rc, 0)
+            self.assertEqual(nudged, [])   # never even looked at state
+            self.assertEqual(clock.sleeps, 0)
+        finally:
+            lockf.close()
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `python3 -m unittest tests.test_waiter -v`
+Expected: ERRORs — `cmd_wait` signature mismatch / no attribute `cmd_wait`
+
+- [ ] **Step 3: Implement**
+
+Add to `autoresume.py`:
+
+```python
+def cmd_wait(tick=60, sleep=time.sleep, now_fn=None, nudge=nudge_entry):
+    """The waiter: a deliberately-not-a-daemon loop that exists only while
+    entries are pending.
+
+    Singleton by election: whoever wins the flock runs; everyone else exits
+    on the spot. Hooks spawn waiters unconditionally, so losing this race
+    is the normal case, not an error.
+    """
+    now_fn = now_fn or (lambda: datetime.now().astimezone())
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    lockf = open(d / "waiter.lock", "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+
+    log("waiter: elected, watching for due sessions")
+    try:
+        while True:
+            now = now_fn()
+            with locked_state() as entries:
+                if not entries:
+                    log("waiter: nothing pending, exiting")
+                    return 0
+                due = [dict(e) for e in entries.values()
+                       if from_iso(e["next_attempt_at"]) <= now]
+
+            for snapshot in due:
+                outcome = nudge(snapshot)
+                sid = snapshot["session_id"]
+                short = sid[:8]
+                with locked_state() as entries:
+                    if sid not in entries:
+                        # Stop hook cleared it while we nudged: the session
+                        # progressed some other way. Leave it cleared.
+                        continue
+                    if outcome == "resumed":
+                        entries.pop(sid)
+                        notify("claude-auto-resume",
+                               f"Resumed session {short} — back to work.")
+                    elif outcome in ("dead_pane", "no_pane_id"):
+                        entries.pop(sid)
+                        notify("claude-auto-resume",
+                               f"Can't reach session {short} ({outcome}). "
+                               f"Resume it by hand.")
+                    else:  # retry
+                        e = entries[sid]
+                        e["attempts"] += 1
+                        if e["attempts"] >= MAX_ATTEMPTS:
+                            entries.pop(sid)
+                            log(f"waiter: gave up on {short} after "
+                                f"{MAX_ATTEMPTS} attempts")
+                            notify("claude-auto-resume",
+                                   f"Gave up on session {short} after "
+                                   f"{MAX_ATTEMPTS} attempts. Resume it by hand.")
+                        else:
+                            e["next_attempt_at"] = iso(
+                                next_attempt_time(e, now_fn()))
+                            log(f"waiter: {short} attempt "
+                                f"{e['attempts']}, next {e['next_attempt_at']}")
+
+            sleep(tick)
+    finally:
+        fcntl.flock(lockf, fcntl.LOCK_UN)
+        lockf.close()
+```
+
+Note for the implementer: the give-up branch logs `"waiter: gave up ..."`
+in addition to notifying, because `test_retry_backs_off_then_gives_up_at_max`
+greps the log for the lowercase phrase "gave up" while the user-facing
+notification copy stays capitalized. The dead-pane test's target ("by hand")
+already appears in the log via `notify()`, which logs its own body.
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `python3 -m unittest tests.test_waiter -v` → `OK` (8 tests)
+Full suite: `python3 -m unittest discover -s tests -v` → `OK`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add autoresume.py tests/test_waiter.py
+git commit -m "Waiter: flock-elected loop that nudges due sessions, 3-strike cap
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 8: install / uninstall
+
+**Files:**
+- Modify: `autoresume.py`
+- Create: `tests/test_install.py`
+
+**Interfaces:**
+- Consumes: `state_dir`, `log`.
+- Produces: `settings_path() -> Path` (honours env `CLAUDE_SETTINGS_PATH`), `cmd_install() -> int`, `cmd_uninstall() -> int`. Install writes `<state>/install-manifest.json` = `{"settings_path": str, "commands": [str, str]}`; uninstall removes exactly those command strings and deletes the manifest.
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/test_install.py`:
+
+```python
+import json
+import os
+import unittest
+
+import autoresume
+from tests.helpers import TempStateMixin
+
+
+class TestInstall(TempStateMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.settings = self.tmp / "claude" / "settings.json"
+        os.environ["CLAUDE_SETTINGS_PATH"] = str(self.settings)
+
+    def read_settings(self):
+        return json.loads(self.settings.read_text())
+
+    def test_fresh_install_wires_both_hooks_and_manifest(self):
+        rc = autoresume.cmd_install()
+        self.assertEqual(rc, 0)
+        data = self.read_settings()
+        sf = data["hooks"]["StopFailure"]
+        self.assertEqual(sf[0]["matcher"], "rate_limit")
+        self.assertIn("hook-stop-failure", sf[0]["hooks"][0]["command"])
+        self.assertIn("hook-stop", data["hooks"]["Stop"][0]["hooks"][0]["command"])
+        manifest = json.loads(
+            (self.state / "install-manifest.json").read_text())
+        self.assertEqual(len(manifest["commands"]), 2)
+        self.assertEqual(manifest["settings_path"], str(self.settings))
+
+    def test_install_is_idempotent(self):
+        autoresume.cmd_install()
+        autoresume.cmd_install()
+        data = self.read_settings()
+        self.assertEqual(len(data["hooks"]["StopFailure"]), 1)
+        self.assertEqual(len(data["hooks"]["Stop"]), 1)
+
+    def test_install_preserves_existing_settings_and_backs_up(self):
+        self.settings.parent.mkdir(parents=True)
+        self.settings.write_text(json.dumps({
+            "model": "opus",
+            "hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": "say done"}]}]},
+        }))
+        autoresume.cmd_install()
+        data = self.read_settings()
+        self.assertEqual(data["model"], "opus")
+        stop_cmds = [h["command"] for grp in data["hooks"]["Stop"]
+                     for h in grp["hooks"]]
+        self.assertIn("say done", stop_cmds)
+        self.assertEqual(len(stop_cmds), 2)
+        backups = list(self.settings.parent.glob("settings.json.backup-*"))
+        self.assertEqual(len(backups), 1)
+
+    def test_uninstall_removes_only_ours(self):
+        self.settings.parent.mkdir(parents=True)
+        self.settings.write_text(json.dumps({
+            "hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": "say done"}]}]},
+        }))
+        autoresume.cmd_install()
+        rc = autoresume.cmd_uninstall()
+        self.assertEqual(rc, 0)
+        data = self.read_settings()
+        stop_cmds = [h["command"] for grp in data["hooks"]["Stop"]
+                     for h in grp["hooks"]]
+        self.assertEqual(stop_cmds, ["say done"])
+        self.assertNotIn("StopFailure", data["hooks"])
+        self.assertFalse((self.state / "install-manifest.json").exists())
+
+    def test_uninstall_without_manifest_says_so(self):
+        self.assertEqual(autoresume.cmd_uninstall(), 1)
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `python3 -m unittest tests.test_install -v`
+Expected: ERRORs — no attribute `cmd_install`
+
+- [ ] **Step 3: Implement**
+
+Add to `autoresume.py`:
+
+```python
+def settings_path():
+    return Path(os.environ.get(
+        "CLAUDE_SETTINGS_PATH",
+        str(Path.home() / ".claude" / "settings.json")))
+
+
+def _hook_commands():
+    """The exact command strings we wire into Claude settings. Absolute
+    paths: hooks run with no useful PATH or cwd guarantees."""
+    me = Path(__file__).resolve()
+    return {
+        "StopFailure": f'"{sys.executable}" "{me}" hook-stop-failure',
+        "Stop": f'"{sys.executable}" "{me}" hook-stop',
+    }
+
+
+def _existing_commands(groups):
+    return {h.get("command") for grp in groups for h in grp.get("hooks", [])}
+
+
+def cmd_install():
+    sp = settings_path()
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if sp.exists():
+        backup = sp.with_name(f"settings.json.backup-{int(time.time())}")
+        backup.write_text(sp.read_text())
+        print(f"backed up settings to {backup}")
+        data = json.loads(sp.read_text())  # corrupt settings should fail
+                                           # loudly here, not get clobbered
+
+    cmds = _hook_commands()
+    hooks = data.setdefault("hooks", {})
+    added = []
+
+    sf = hooks.setdefault("StopFailure", [])
+    if cmds["StopFailure"] not in _existing_commands(sf):
+        sf.append({"matcher": "rate_limit", "hooks": [
+            {"type": "command", "command": cmds["StopFailure"]}]})
+        added.append(cmds["StopFailure"])
+
+    st = hooks.setdefault("Stop", [])
+    if cmds["Stop"] not in _existing_commands(st):
+        st.append({"hooks": [
+            {"type": "command", "command": cmds["Stop"]}]})
+        added.append(cmds["Stop"])
+
+    sp.write_text(json.dumps(data, indent=2) + "\n")
+
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "install-manifest.json").write_text(json.dumps(
+        {"settings_path": str(sp), "commands": list(cmds.values())},
+        indent=2) + "\n")
+
+    for c in added:
+        print(f"added hook: {c}")
+    if not added:
+        print("hooks already installed, nothing to do")
+    return 0
+
+
+def cmd_uninstall():
+    mf = state_dir() / "install-manifest.json"
+    if not mf.exists():
+        print("no install manifest found — nothing to remove", file=sys.stderr)
+        return 1
+    manifest = json.loads(mf.read_text())
+    ours = set(manifest["commands"])
+    sp = Path(manifest["settings_path"])
+    removed = 0
+    if sp.exists():
+        data = json.loads(sp.read_text())
+        events = data.get("hooks", {})
+        for event in list(events):
+            groups = events[event]
+            for grp in list(groups):
+                kept = [h for h in grp.get("hooks", [])
+                        if h.get("command") not in ours]
+                removed += len(grp.get("hooks", [])) - len(kept)
+                if kept:
+                    grp["hooks"] = kept
+                else:
+                    groups.remove(grp)
+            if not groups:
+                del events[event]
+        sp.write_text(json.dumps(data, indent=2) + "\n")
+    mf.unlink()
+    print(f"removed {removed} hook entr{'y' if removed == 1 else 'ies'}")
+    return 0
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `python3 -m unittest tests.test_install -v` → `OK` (5 tests)
+Full suite: `python3 -m unittest discover -s tests -v` → `OK`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add autoresume.py tests/test_install.py
+git commit -m "install/uninstall: manifest-tracked hook wiring in Claude settings
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 9: CLI wiring — status, manual nudge, dispatch
+
+**Files:**
+- Modify: `autoresume.py` (replace the stub `main`)
+- Create: `tests/test_cli.py`
+
+**Interfaces:**
+- Consumes: everything above.
+- Produces: `main(argv) -> int` dispatching: `install`, `uninstall`, `status`, `nudge <session-id>`, `wait`, `hook-stop-failure`, `hook-stop`, `help`. `waiter_is_running() -> bool`. `cmd_status() -> int`, `cmd_nudge(sid) -> int`. Manual dispatch, not argparse — exit codes stay explicit and testable (return 2 + usage on unknown commands, never `sys.exit` from inside `main`).
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/test_cli.py`:
+
+```python
+import contextlib
+import io
+import unittest
+
+import autoresume
+from tests.helpers import TempStateMixin
+
+
+def run_main(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = autoresume.main(list(argv))
+    return rc, out.getvalue(), err.getvalue()
+
+
+class TestCli(TempStateMixin, unittest.TestCase):
+    def test_no_args_prints_usage_ok(self):
+        rc, out, _ = run_main()
+        self.assertEqual(rc, 0)
+        self.assertIn("claude-auto-resume", out)
+        self.assertIn("install", out)
+
+    def test_unknown_command_is_exit_2(self):
+        rc, _, err = run_main("frobnicate")
+        self.assertEqual(rc, 2)
+        self.assertIn("claude-auto-resume", err)
+
+    def test_status_empty(self):
+        rc, out, _ = run_main("status")
+        self.assertEqual(rc, 0)
+        self.assertIn("waiter: not running", out)
+        self.assertIn("nothing pending", out)
+
+    def test_status_lists_entries(self):
+        with autoresume.locked_state() as s:
+            s["sess-abc"] = {
+                "session_id": "sess-abc", "transcript_path": "/t",
+                "cwd": "/tmp", "surface_id": "surf-1", "workspace_id": None,
+                "detected_at": "2026-07-05T13:00:00+00:00",
+                "reset_at": None, "attempts": 1,
+                "next_attempt_at": "2026-07-05T14:00:00+00:00",
+            }
+        rc, out, _ = run_main("status")
+        self.assertEqual(rc, 0)
+        self.assertIn("sess-abc", out)
+        self.assertIn("attempts=1", out)
+
+    def test_nudge_unknown_session_fails(self):
+        rc, _, err = run_main("nudge", "nope")
+        self.assertEqual(rc, 1)
+        self.assertIn("no pending entry", err)
+
+    def test_hook_commands_read_stdin(self):
+        import json
+        import sys
+        with autoresume.locked_state() as s:
+            s["sess-x"] = {"session_id": "sess-x", "attempts": 0}
+        old = sys.stdin
+        sys.stdin = io.StringIO(json.dumps({"session_id": "sess-x"}))
+        try:
+            rc, _, _ = run_main("hook-stop")
+        finally:
+            sys.stdin = old
+        self.assertEqual(rc, 0)
+        with autoresume.locked_state() as s:
+            self.assertEqual(s, {})
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `python3 -m unittest tests.test_cli -v`
+Expected: FAILures — stub `main` returns 0 for everything and prints nothing
+
+- [ ] **Step 3: Implement**
+
+Replace the stub `main` in `autoresume.py` with:
+
+```python
+USAGE = """\
+claude-auto-resume — resume usage-limited Claude Code sessions in cmux
+
+usage: claude-auto-resume <command>
+
+  install       wire the hooks into Claude Code's settings.json
+  uninstall     remove exactly what install added, nothing else
+  status        show pending sessions and whether the waiter is alive
+  nudge <sid>   try to resume one pending session right now
+  wait          run the waiter loop in the foreground (debugging)
+
+internal commands invoked by Claude Code hooks:
+  hook-stop-failure, hook-stop
+"""
+
+
+def waiter_is_running():
+    """A waiter holds an exclusive flock for its whole life, so 'can we
+    take the lock' is the liveness check — no pidfiles to go stale."""
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(d / "waiter.lock", "w") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+
+
+def cmd_status():
+    print(f"waiter: {'running' if waiter_is_running() else 'not running'}")
+    with locked_state() as entries:
+        snapshot = list(entries.values())
+    if not snapshot:
+        print("nothing pending")
+        return 0
+    for e in snapshot:
+        print(f"{e['session_id']}  attempts={e['attempts']}  "
+              f"reset_at={e['reset_at'] or '?'}  "
+              f"next={e['next_attempt_at']}  "
+              f"pane={e['surface_id'] or '-'}")
+    return 0
+
+
+def cmd_nudge(sid):
+    with locked_state() as entries:
+        entry = entries.get(sid)
+    if entry is None:
+        print(f"no pending entry for {sid}", file=sys.stderr)
+        return 1
+    outcome = nudge_entry(entry)
+    print(outcome)
+    if outcome == "resumed":
+        with locked_state() as entries:
+            entries.pop(sid, None)
+        return 0
+    return 1
+
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in ("help", "-h", "--help"):
+        print(USAGE)
+        return 0
+    cmd, rest = args[0], args[1:]
+    if cmd == "hook-stop-failure":
+        return cmd_hook_stop_failure(sys.stdin.read())
+    if cmd == "hook-stop":
+        return cmd_hook_stop(sys.stdin.read())
+    if cmd == "wait":
+        return cmd_wait()
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "nudge" and len(rest) == 1:
+        return cmd_nudge(rest[0])
+    if cmd == "install":
+        return cmd_install()
+    if cmd == "uninstall":
+        return cmd_uninstall()
+    print(USAGE, file=sys.stderr)
+    return 2
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `python3 -m unittest tests.test_cli -v` → `OK` (6 tests)
+Full suite: `python3 -m unittest discover -s tests -v` → `OK` (all tasks' tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add autoresume.py tests/test_cli.py
+git commit -m "CLI: status, manual nudge, and command dispatch
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 10: README and end-to-end dry run
+
+**Files:**
+- Create: `README.md`
+
+**Interfaces:**
+- Consumes: the finished CLI.
+- Produces: user-facing docs, including the Phase-0 recon checklist from the spec.
+
+- [ ] **Step 1: Write the README**
+
+Voice requirement (from Josh, non-negotiable): plain human writing. No
+"Welcome to X, a powerful tool", no emoji bullet walls, no feature-grid
+boilerplate. Short sentences, real caveats, explain the why. The text below
+is the README — copy it exactly:
+
+```markdown
+# auto-message-claude
+
+Long Claude Code jobs die when your usage limit runs out, and then they sit
+there until you come back and type "continue". If the limit reset at 6pm and
+you got back at 9, you lost three hours for no reason.
+
+This tool closes that gap. When a session inside [cmux](https://cmux.com)
+hits a usage limit, a Claude Code hook records which pane it was in and when
+the limit resets. A small background process waits out the reset, then types
+into that pane:
+
+> Usage limits have reset — continue where you left off. If the task is
+> already complete, ignore this message.
+
+If the session picks the message up and starts working, done. If not, it
+retries — at most three attempts, ten minutes apart — then sends you a
+notification and stops. It never loops forever and it never touches a
+session that finished on its own (a second hook clears those).
+
+## What you need
+
+- macOS, with sessions running inside [cmux](https://github.com/manaflow-ai/cmux)
+- Claude Code recent enough to have the `StopFailure` hook event
+- Python 3.9+ (the system one is fine; there are no dependencies)
+
+## Install
+
+```
+git clone https://github.com/joshuatrobertson/auto-message-claude
+cd auto-message-claude
+./bin/claude-auto-resume install
+```
+
+`install` adds two hooks to `~/.claude/settings.json` (it backs the file up
+first and prints exactly what it added). `./bin/claude-auto-resume uninstall`
+removes exactly those entries and nothing else.
+
+## Commands
+
+```
+claude-auto-resume status       what's pending, and is the waiter alive
+claude-auto-resume nudge <sid>  push one session right now, see the outcome
+claude-auto-resume wait         run the waiter in the foreground to watch it
+```
+
+State, logs and captured hook payloads live in
+`~/.local/state/claude-auto-resume/`. The log is plain text; read it when
+anything surprises you.
+
+## Verifying it on your machine
+
+The two things this tool leans on that Anthropic and cmux don't guarantee:
+
+1. **The hook payload format.** Every rate-limit event's raw payload is
+   archived to `~/.local/state/claude-auto-resume/captures/`. After your
+   first real limit hit, look at the capture. If `status` shows
+   `reset_at=?`, the parser didn't understand the new format — file an
+   issue with the (redacted) capture, or fix `parse_reset_at` and add the
+   capture to `tests/`.
+2. **cmux socket access from a detached process.** The waiter inherits its
+   pane's environment, which is what lets it talk to cmux hours later. If
+   `status` shows the waiter running but nudges land nowhere (check the
+   log), launch cmux with `CMUX_SOCKET_MODE=allowAll` and see the cmux docs
+   on socket access modes.
+
+Also worth knowing: `REPL_MARKERS` at the top of `autoresume.py` is the list
+of strings that identify a live Claude prompt on screen. Claude Code's TUI
+chrome changes now and then; if the tool starts relaunching sessions that
+were alive, that list needs a refresh from a real `cmux read-screen` capture.
+
+## Caveats, honestly
+
+- Your Mac has to be awake at reset time. This tool doesn't fight power
+  management — run `caffeinate` (or equivalent) for overnight jobs.
+- Sessions outside cmux get a notification instead of a resume. Typing into
+  arbitrary terminals isn't something I'm willing to guess at, and headless
+  `claude -p --resume` can stall silently on permission prompts.
+- A job that legitimately needs four usage windows gets resumed four times.
+  That's the point — but you'll get a notification each time, so a runaway
+  job won't burn windows quietly.
+- The reset-time formats and TUI markers are reverse-engineered, not
+  documented. Expect the odd touch-up after Claude Code updates; the
+  captures directory exists to make those touch-ups five-minute jobs.
+
+## How it works, in one paragraph
+
+`StopFailure` hook (matcher `rate_limit`) → entry in a flock-guarded JSON
+state file + raw payload archived → detached waiter (flock-elected
+singleton, exits when idle) sleeps in 60s ticks → at reset time it reads
+the pane over the cmux socket, types the message (relaunching
+`claude --resume <id>` first if the process exited), then confirms success
+by watching for a new assistant message in the session's transcript JSONL —
+the only evidence that actually proves the session is working again. Design
+docs with the full reasoning are in `docs/superpowers/specs/`.
+```
+
+- [ ] **Step 2: End-to-end dry run**
+
+No new test code — this exercises the real CLI against a fake cmux, exactly
+as a subagent can run it. From the repo root:
+
+```bash
+export CLAUDE_AUTO_RESUME_STATE_DIR=$(mktemp -d)
+export CLAUDE_SETTINGS_PATH=$CLAUDE_AUTO_RESUME_STATE_DIR/settings.json
+
+# 1. install wires hooks into the (empty) settings file
+./bin/claude-auto-resume install
+cat "$CLAUDE_SETTINGS_PATH"          # expect: StopFailure + Stop entries
+
+# 2. simulate a limit hit (no real cmux needed for recording)
+echo '{"session_id":"dry-run-1","transcript_path":"/tmp/nope.jsonl",
+"cwd":"/tmp","error":"rate_limit",
+"error_details":"Your limit will reset at 11:59pm."}' \
+  | ./bin/claude-auto-resume hook-stop-failure
+
+# 3. entry recorded, payload captured, waiter self-elected
+./bin/claude-auto-resume status      # expect: dry-run-1, attempts=0,
+                                     # reset_at set, waiter: running
+ls "$CLAUDE_AUTO_RESUME_STATE_DIR/captures"   # expect: one .json
+
+# 4. the Stop hook clears it (session "finished")
+echo '{"session_id":"dry-run-1"}' | ./bin/claude-auto-resume hook-stop
+./bin/claude-auto-resume status      # expect: nothing pending
+                                     # (waiter exits within one tick)
+
+# 5. uninstall restores settings
+./bin/claude-auto-resume uninstall
+cat "$CLAUDE_SETTINGS_PATH"          # expect: no claude-auto-resume hooks
+```
+
+Expected outputs are noted inline. If step 3 shows `reset_at=?` the parser
+regressed; if `status` shows the waiter not running, check
+`$CLAUDE_AUTO_RESUME_STATE_DIR/log`.
+
+- [ ] **Step 3: Full suite one last time**
+
+Run: `python3 -m unittest discover -s tests -v`
+Expected: `OK`, zero failures, zero errors.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add README.md
+git commit -m "README: what it does, how to verify it, honest caveats
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+```
+
+---
+
+## Post-implementation (manual, Josh's side)
+
+Not tasks for a subagent — these need real limit events on the real machine:
+
+1. Run `./bin/claude-auto-resume install` for real (no env overrides).
+2. Next time a limit hits: check `status` within a few minutes, confirm the
+   entry and its `reset_at`, and let it fire. Check the log afterwards.
+3. Compare the captured payload against the parser's assumptions; promote it
+   (redacted) into `tests/` as a fixture.
+4. Confirm the waiter can still reach cmux hours after spawning; if not,
+   document `CMUX_SOCKET_MODE=allowAll` in the README as required, not
+   optional.
