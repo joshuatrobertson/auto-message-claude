@@ -3,8 +3,8 @@
 
 One file on purpose. A Claude Code StopFailure hook records interrupted
 sessions here; a detached waiter sleeps until the limit resets, then types a
-continue message into the original cmux pane. Design rationale lives in
-docs/superpowers/specs/2026-07-05-auto-resume-design.md.
+continue message into the original cmux pane. See README.md for the how and
+the why.
 """
 import os
 import subprocess
@@ -16,12 +16,12 @@ MESSAGE = ("Usage limits have reset — continue where you left off. "
 MAX_ATTEMPTS = 3
 
 import fcntl
-import json  # noqa: F401  (used from Task 3 on; imported here to keep one block)
+import json
 import re
 import shlex
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 RESET_BUFFER = timedelta(minutes=2)
