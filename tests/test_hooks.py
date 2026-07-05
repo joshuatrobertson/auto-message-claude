@@ -26,7 +26,32 @@ def run_hook(payload=PAYLOAD, env=ENV, now=NOW, spawns=None):
     return rc, spawns
 
 
+# The shape an actual Claude Code StopFailure delivered on 2026-07-05
+# (paths redacted): no error_details at all — the reset time lives in
+# last_assistant_message. The first live run missed it and fell back to
+# the ladder; this pins the field extraction to reality.
+REAL_PAYLOAD = {
+    "session_id": "512eb41b-0000-0000-0000-000000000000",
+    "transcript_path": "/tmp/t/512eb41b.jsonl",
+    "cwd": "/tmp/proj",
+    "prompt_id": "769faf8f-0000-0000-0000-000000000000",
+    "effort": {"level": "high"},
+    "hook_event_name": "StopFailure",
+    "error": "rate_limit",
+    "last_assistant_message":
+        "You've hit your session limit · resets 11:10pm (Europe/London)",
+}
+
+
 class TestStopFailureHook(TempStateMixin, unittest.TestCase):
+    def test_reset_time_read_from_last_assistant_message(self):
+        run_hook(payload=REAL_PAYLOAD)
+        with autoresume.locked_state() as entries:
+            e = entries[REAL_PAYLOAD["session_id"]]
+        self.assertIsNotNone(e["reset_at"], "parser never saw the message")
+        got = autoresume.from_iso(e["reset_at"])
+        self.assertEqual((got.hour, got.minute), (23, 10))
+
     def test_creates_entry_with_schema_and_spawns_waiter(self):
         rc, spawns = run_hook()
         self.assertEqual(rc, 0)

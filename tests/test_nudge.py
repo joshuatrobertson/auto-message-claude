@@ -10,21 +10,26 @@ SHELL_SCREEN = "josh@mac proj %"
 
 
 class NudgeHarness(TempStateMixin, unittest.TestCase):
-    """Scripts a fake cmux: panels list and a queue of screens (one per
-    read-screen call), and records every cmux invocation to calls.log."""
+    """Scripts a fake cmux that behaves like the real CLI observed live:
+    read-screen serves a queue of screens (one per call, then blank), and
+    exits 1 with an Error line when the surface is gone — surfaces are
+    addressed by the UUID from CMUX_SURFACE_ID. Every invocation is
+    recorded to calls.log."""
 
     def setUp(self):
         super().setUp()
         self.calls = self.tmp / "calls.log"
-        self.panels = self.tmp / "panels.txt"
         self.screens = self.tmp / "screens"
         self.screens.mkdir()
-        self.panels.write_text("surf-9\n")
+        self.gone = self.tmp / "surface-gone"
         self.make_fake_bin("cmux", f"""
 echo "$@" >> {self.calls}
 case "$1" in
-  list-panels) cat {self.panels} ;;
   read-screen)
+    if [ -e {self.gone} ]; then
+      echo "Error: invalid_params: Surface is not a terminal"
+      exit 1
+    fi
     f=$(ls {self.screens} | head -1)
     if [ -n "$f" ]; then cat {self.screens}/$f; rm {self.screens}/$f; fi ;;
 esac
@@ -36,7 +41,7 @@ exit 0
             "session_id": "sess-123",
             "transcript_path": str(self.transcript),
             "cwd": "/Users/josh/my proj",   # space is deliberate: quoting
-            "surface_id": "surf-9",
+            "surface_id": "8314FBC5-FC77-4C8F-8115-F3CBCAD03F4E",
             "workspace_id": "ws-2",
             "detected_at": "2026-07-05T13:00:00+00:00",
             "reset_at": None, "attempts": 0,
@@ -95,9 +100,23 @@ class TestNudge(NudgeHarness):
         self.assertEqual(out, "retry")
 
     def test_gone_pane_is_dead(self):
-        self.panels.write_text("other-surface\n")
+        # Real cmux exits 1 ("Error: invalid_params: ...") when the surface
+        # no longer exists. That probe result — not list-panels, whose
+        # output shows numeric handles that can never match our UUIDs — is
+        # how a dead pane is detected.
+        self.gone.touch()
         out = autoresume.nudge_entry(self.entry, sleep=lambda s: None)
         self.assertEqual(out, "dead_pane")
+
+    def test_nudge_never_calls_list_panels(self):
+        # list-panels prints "surface:77"-style handles; our IDs are UUIDs.
+        # Membership checks against that output match nothing, so the code
+        # must not consult it (the first live run failed exactly this way).
+        self.queue_screen(REPL_SCREEN)
+        autoresume.nudge_entry(self.entry,
+                               sleep=self.grow_transcript_on_sleep())
+        self.assertFalse(any(l.startswith("list-panels")
+                             for l in self.cmux_call_lines()))
 
     def test_entry_without_surface_is_no_pane_id(self):
         self.entry["surface_id"] = None

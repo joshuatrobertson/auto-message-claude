@@ -267,8 +267,14 @@ def cmd_hook_stop_failure(stdin_text, env=os.environ, now=None, spawn=None):
         stamp = now.strftime("%Y%m%dT%H%M%S")
         (cap / f"{stamp}-{sid[:8]}.json").write_text(stdin_text)
 
+        # The reset time has moved between fields before. In the payloads
+        # captured live (2026-07-05) it arrives in last_assistant_message
+        # ("You've hit your session limit · resets 11:10pm (Europe/London)")
+        # and error_details doesn't exist — so scan every field it has
+        # been seen in.
         error_text = " ".join(
-            str(payload.get(k, "")) for k in ("error", "error_details"))
+            str(payload.get(k, ""))
+            for k in ("error", "error_details", "last_assistant_message"))
         reset_at = parse_reset_at(error_text, now)
 
         with locked_state() as entries:
@@ -330,12 +336,16 @@ def nudge_entry(entry, sleep=time.sleep, verify_wait=30):
     if not surface:
         return "no_pane_id"
     try:
-        panels = cmux("list-panels")
-        if panels.returncode != 0 or surface not in panels.stdout:
+        # The read-screen probe doubles as the pane-exists check: the real
+        # CLI exits 1 ("Error: invalid_params: ...") for a surface that's
+        # gone. Don't consult list-panels — it prints numeric handles
+        # ("surface:77") while our IDs are the UUIDs from CMUX_SURFACE_ID,
+        # so membership checks against it match nothing.
+        probe = cmux("read-screen", "--surface", surface, "--lines", "50")
+        if probe.returncode != 0:
             return "dead_pane"
 
-        screen = cmux("read-screen", "--surface", surface,
-                      "--lines", "50").stdout
+        screen = probe.stdout
         if classify_pane(screen) == "shell":
             # claude exited on the limit (it does that sometimes — cmux
             # issue #2488). Relaunch it resumed, in the right directory.
