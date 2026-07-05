@@ -434,6 +434,102 @@ def cmd_wait(tick=60, sleep=time.sleep, now_fn=None, nudge=nudge_entry):
         lockf.close()
 
 
+def settings_path():
+    """Path to Claude Code's settings.json, honouring env CLAUDE_SETTINGS_PATH."""
+    return Path(os.environ.get(
+        "CLAUDE_SETTINGS_PATH",
+        str(Path.home() / ".claude" / "settings.json")))
+
+
+def _hook_commands():
+    """The exact command strings we wire into Claude settings. Absolute
+    paths: hooks run with no useful PATH or cwd guarantees."""
+    me = Path(__file__).resolve()
+    return {
+        "StopFailure": f'"{sys.executable}" "{me}" hook-stop-failure',
+        "Stop": f'"{sys.executable}" "{me}" hook-stop',
+    }
+
+
+def _existing_commands(groups):
+    """Extract command strings from a list of hook groups."""
+    return {h.get("command") for grp in groups for h in grp.get("hooks", [])}
+
+
+def cmd_install():
+    """Install the auto-resume hooks into Claude Code's settings.json."""
+    sp = settings_path()
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if sp.exists():
+        backup = sp.with_name(f"settings.json.backup-{int(time.time())}")
+        backup.write_text(sp.read_text())
+        print(f"backed up settings to {backup}")
+        data = json.loads(sp.read_text())  # corrupt settings should fail
+                                           # loudly here, not get clobbered
+
+    cmds = _hook_commands()
+    hooks = data.setdefault("hooks", {})
+    added = []
+
+    sf = hooks.setdefault("StopFailure", [])
+    if cmds["StopFailure"] not in _existing_commands(sf):
+        sf.append({"matcher": "rate_limit", "hooks": [
+            {"type": "command", "command": cmds["StopFailure"]}]})
+        added.append(cmds["StopFailure"])
+
+    st = hooks.setdefault("Stop", [])
+    if cmds["Stop"] not in _existing_commands(st):
+        st.append({"hooks": [
+            {"type": "command", "command": cmds["Stop"]}]})
+        added.append(cmds["Stop"])
+
+    sp.write_text(json.dumps(data, indent=2) + "\n")
+
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "install-manifest.json").write_text(json.dumps(
+        {"settings_path": str(sp), "commands": list(cmds.values())},
+        indent=2) + "\n")
+
+    for c in added:
+        print(f"added hook: {c}")
+    if not added:
+        print("hooks already installed, nothing to do")
+    return 0
+
+
+def cmd_uninstall():
+    """Remove auto-resume hooks from Claude Code's settings.json."""
+    mf = state_dir() / "install-manifest.json"
+    if not mf.exists():
+        print("no install manifest found — nothing to remove", file=sys.stderr)
+        return 1
+    manifest = json.loads(mf.read_text())
+    ours = set(manifest["commands"])
+    sp = Path(manifest["settings_path"])
+    removed = 0
+    if sp.exists():
+        data = json.loads(sp.read_text())
+        events = data.get("hooks", {})
+        for event in list(events):
+            groups = events[event]
+            for grp in list(groups):
+                kept = [h for h in grp.get("hooks", [])
+                        if h.get("command") not in ours]
+                removed += len(grp.get("hooks", [])) - len(kept)
+                if kept:
+                    grp["hooks"] = kept
+                else:
+                    groups.remove(grp)
+            if not groups:
+                del events[event]
+        sp.write_text(json.dumps(data, indent=2) + "\n")
+    mf.unlink()
+    print(f"removed {removed} hook entr{'y' if removed == 1 else 'ies'}")
+    return 0
+
+
 def main(argv=None) -> int:
     return 0
 
