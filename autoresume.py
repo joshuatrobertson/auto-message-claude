@@ -14,8 +14,11 @@ MESSAGE = ("Usage limits have reset — continue where you left off. "
            "If the task is already complete, ignore this message.")
 MAX_ATTEMPTS = 3
 
+import fcntl
 import json  # noqa: F401  (used from Task 3 on; imported here to keep one block)
 import re
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -91,6 +94,55 @@ def state_dir() -> Path:
         "CLAUDE_AUTO_RESUME_STATE_DIR",
         str(Path.home() / ".local" / "state" / "claude-auto-resume"),
     ))
+
+
+def iso(dt):
+    return dt.isoformat()
+
+
+def from_iso(s):
+    return datetime.fromisoformat(s)
+
+
+def log(msg):
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    with open(d / "log", "a") as f:
+        f.write(f"{stamp} {msg}\n")
+
+
+@contextmanager
+def locked_state():
+    """Read-modify-write the pending-sessions file under an exclusive lock.
+
+    Several sessions can hit the limit in the same second, and the waiter
+    mutates entries while hooks add them — every access goes through here.
+    A corrupt file is renamed aside and treated as empty: a hook must never
+    crash, and losing pending entries is recoverable (the next limit event
+    re-adds them); crashing the hook chain is not.
+    """
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / "state.json"
+    with open(d / "state.lock", "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            entries = {}
+            if path.exists():
+                try:
+                    entries = json.loads(path.read_text())
+                    if not isinstance(entries, dict):
+                        raise ValueError("state root must be an object")
+                except (ValueError, json.JSONDecodeError):
+                    path.rename(d / f"state.json.corrupt-{int(time.time())}")
+                    entries = {}
+            yield entries
+            tmp = d / "state.json.tmp"
+            tmp.write_text(json.dumps(entries, indent=2))
+            tmp.rename(path)
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
 def main(argv=None) -> int:
