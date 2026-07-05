@@ -30,6 +30,81 @@ LADDER = [timedelta(hours=1), timedelta(hours=3), timedelta(hours=5)]
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday",
             "friday", "saturday", "sunday"]
 
+# Strings that mean "a live Claude REPL is on screen". The TUI's chrome is
+# not a stable API — Phase 0 recon replaces these with strings from real
+# `cmux read-screen` captures, and they'll need the odd touch-up after
+# Claude Code updates. Low stakes: this only picks HOW we nudge (type into
+# the REPL vs relaunch claude first); the transcript check judges success.
+REPL_MARKERS = (
+    "? for shortcuts",
+    "esc to interrupt",
+    "/help for help",
+    "╭─",
+)
+
+_SHELL_PROMPT_RE = re.compile(r"[$%❯>]\s*$")
+
+
+def classify_pane(screen):
+    if any(marker in screen for marker in REPL_MARKERS):
+        return "repl"
+    lines = [ln.rstrip() for ln in screen.splitlines() if ln.strip()]
+    if lines and _SHELL_PROMPT_RE.search(lines[-1]):
+        return "shell"
+    return "unknown"
+
+
+def cmux(*args, timeout=15):
+    """Run the cmux CLI. Non-zero exits come back in the result; only a
+    missing binary or a hang raises — callers treat any Exception as a
+    failed nudge attempt, which is the safe direction."""
+    return subprocess.run(("cmux",) + args, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def notify(title, body):
+    """Tell the human. Both channels are best-effort: notifications failing
+    must never take down the waiter."""
+    for cmd in (("cmux", "notify", "--title", title, body),
+                ("osascript", "-e",
+                 f'display notification {json.dumps(body)} '
+                 f'with title {json.dumps(title)}')):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=10)
+        except Exception:
+            pass
+    try:
+        log(f"notify: {title}: {body}")
+    except Exception:
+        pass
+
+
+def transcript_has_assistant_after(path, since):
+    """True iff the session transcript has an assistant message newer than
+    `since` — the only evidence we trust that a resume actually worked."""
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "assistant":
+            continue
+        ts = obj.get("timestamp")
+        if not ts:
+            continue
+        try:
+            when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if when > since:
+            return True
+    return False
+
+
 # The reset time arrives inside human-readable error text, and Anthropic has
 # changed its shape before. Parsers are tried strictest-first; if none match
 # we return None and the caller falls back to a retry ladder. Never guess.
