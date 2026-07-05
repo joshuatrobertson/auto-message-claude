@@ -18,6 +18,7 @@ MAX_ATTEMPTS = 3
 import fcntl
 import json  # noqa: F401  (used from Task 3 on; imported here to keep one block)
 import re
+import shlex
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -313,6 +314,56 @@ def cmd_hook_stop(stdin_text):
         except Exception:
             pass
     return 0
+
+
+def nudge_entry(entry, sleep=time.sleep, verify_wait=30):
+    """Try to wake one interrupted session. Returns an outcome string; the
+    waiter maps outcomes onto state changes and notifications.
+
+    The screen tells us HOW to nudge (type into a live REPL, or relaunch
+    claude first); only a fresh assistant message in the transcript tells
+    us it WORKED. An unknown screen gets the optimistic path — worst case
+    the verify step calls it a miss and we retry.
+    """
+    sid = entry["session_id"]
+    surface = entry.get("surface_id")
+    if not surface:
+        return "no_pane_id"
+    try:
+        panels = cmux("list-panels")
+        if panels.returncode != 0 or surface not in panels.stdout:
+            return "dead_pane"
+
+        screen = cmux("read-screen", "--surface", surface,
+                      "--lines", "50").stdout
+        if classify_pane(screen) == "shell":
+            # claude exited on the limit (it does that sometimes — cmux
+            # issue #2488). Relaunch it resumed, in the right directory.
+            relaunch = (f"cd {shlex.quote(entry['cwd'])} && "
+                        f"claude --resume {shlex.quote(sid)}")
+            cmux("send", "--surface", surface, relaunch)
+            cmux("send-key", "--surface", surface, "enter")
+            for _ in range(12):          # up to ~60s for the REPL to draw
+                sleep(5)
+                screen = cmux("read-screen", "--surface", surface,
+                              "--lines", "50").stdout
+                if classify_pane(screen) == "repl":
+                    break
+            else:
+                log(f"nudge {sid}: relaunch never reached a REPL")
+                return "retry"
+
+        since = datetime.now().astimezone()
+        cmux("send", "--surface", surface, MESSAGE)
+        cmux("send-key", "--surface", surface, "enter")
+        sleep(verify_wait)
+        if transcript_has_assistant_after(entry["transcript_path"], since):
+            return "resumed"
+        log(f"nudge {sid}: no assistant reply after {verify_wait}s")
+        return "retry"
+    except Exception as exc:
+        log(f"nudge {sid}: {exc!r}")
+        return "retry"
 
 
 def main(argv=None) -> int:
