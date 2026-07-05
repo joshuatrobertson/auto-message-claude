@@ -366,6 +366,74 @@ def nudge_entry(entry, sleep=time.sleep, verify_wait=30):
         return "retry"
 
 
+def cmd_wait(tick=60, sleep=time.sleep, now_fn=None, nudge=nudge_entry):
+    """The waiter: a deliberately-not-a-daemon loop that exists only while
+    entries are pending.
+
+    Singleton by election: whoever wins the flock runs; everyone else exits
+    on the spot. Hooks spawn waiters unconditionally, so losing this race
+    is the normal case, not an error.
+    """
+    now_fn = now_fn or (lambda: datetime.now().astimezone())
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    lockf = open(d / "waiter.lock", "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+
+    log("waiter: elected, watching for due sessions")
+    try:
+        while True:
+            now = now_fn()
+            with locked_state() as entries:
+                if not entries:
+                    log("waiter: nothing pending, exiting")
+                    return 0
+                due = [dict(e) for e in entries.values()
+                       if from_iso(e["next_attempt_at"]) <= now]
+
+            for snapshot in due:
+                outcome = nudge(snapshot)
+                sid = snapshot["session_id"]
+                short = sid[:8]
+                with locked_state() as entries:
+                    if sid not in entries:
+                        # Stop hook cleared it while we nudged: the session
+                        # progressed some other way. Leave it cleared.
+                        continue
+                    if outcome == "resumed":
+                        entries.pop(sid)
+                        notify("claude-auto-resume",
+                               f"Resumed session {short} — back to work.")
+                    elif outcome in ("dead_pane", "no_pane_id"):
+                        entries.pop(sid)
+                        notify("claude-auto-resume",
+                               f"Can't reach session {short} ({outcome}). "
+                               f"Resume it by hand.")
+                    else:  # retry
+                        e = entries[sid]
+                        e["attempts"] += 1
+                        if e["attempts"] >= MAX_ATTEMPTS:
+                            entries.pop(sid)
+                            log(f"waiter: gave up on {short} after "
+                                f"{MAX_ATTEMPTS} attempts")
+                            notify("claude-auto-resume",
+                                   f"Gave up on session {short} after "
+                                   f"{MAX_ATTEMPTS} attempts. Resume it by hand.")
+                        else:
+                            e["next_attempt_at"] = iso(
+                                next_attempt_time(e, now_fn()))
+                            log(f"waiter: {short} attempt "
+                                f"{e['attempts']}, next {e['next_attempt_at']}")
+
+            sleep(tick)
+    finally:
+        fcntl.flock(lockf, fcntl.LOCK_UN)
+        lockf.close()
+
+
 def main(argv=None) -> int:
     return 0
 
