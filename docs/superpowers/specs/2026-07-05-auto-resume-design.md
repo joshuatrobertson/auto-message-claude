@@ -1,7 +1,9 @@
 # claude-auto-resume — design
 
 **Date:** 2026-07-05
-**Status:** awaiting user approval
+**Status:** approved 2026-07-05 (reviewed; four fixes applied — assistant-message
+verification, attempt-preserving upsert, flock-elected waiter singleton,
+cwd-scoped resume + weekday parsing)
 
 ## The problem
 
@@ -97,8 +99,12 @@ Python 3 stdlib and the `cmux`/`claude` CLIs already on the machine.
 three things, fast, then exits:
 
 - Parse reset time from `error` / `error_details` text (see Parser below).
-- Append an entry to the state file, under an exclusive `fcntl.flock` lock
-  (several sessions can hit the limit in the same second):
+- **Upsert** an entry into the state file, under an exclusive `fcntl.flock`
+  lock (several sessions can hit the limit in the same second). If an entry
+  for this `session_id` already exists — which happens when a nudge landed
+  before the limit actually reset — refresh `reset_at` from the new error
+  text but **preserve the attempt count**. A fresh entry every time would
+  reset the counter and turn a nudge-too-early into an infinite loop.
 
   ```json
   {
@@ -114,9 +120,12 @@ three things, fast, then exits:
   }
   ```
 
-- Spawn the waiter, detached (double-fork / `start_new_session=True`), unless
-  the pidfile points at a live process. The waiter inherits the pane's env,
-  which is what grants it cmux socket access.
+- Spawn the waiter, detached (`start_new_session=True`), unconditionally.
+  Singleton enforcement lives in the waiter itself: on startup it takes a
+  non-blocking exclusive `flock` on `waiter.lock` and exits immediately if
+  the lock is held. (Check-a-pidfile-then-spawn from the hook would race
+  when two sessions hit the limit in the same second.) The waiter inherits
+  the pane's env, which is what grants it cmux socket access.
 
 **`Stop`** (no matcher) — a normal turn ended for some session. If a pending
 entry exists for that `session_id`, the session evidently got resumed some
@@ -147,11 +156,18 @@ For one due entry:
 1. `cmux list-panels` — pane gone? → mark failed, notify, drop entry.
 2. `cmux read-screen --surface <id>` to decide the pane's state:
    - Claude REPL alive → `cmux send` the message, `cmux send-key enter`.
-   - Shell prompt (claude exited) → send `claude --resume <session_id>`,
-     wait for the REPL to appear (re-read screen, ≤60s), then send message.
+   - Shell prompt (claude exited) → send
+     `cd <cwd> && claude --resume <session_id>` (resume is scoped to the
+     project directory, and the pane's shell may not still be sitting in
+     it), wait for the REPL to appear (re-read screen, ≤60s), then send
+     the message.
 3. **Verify by transcript, not by screen:** wait ~30s, then check the
-   session's transcript JSONL has grown (size/mtime) since before the nudge.
-   Growth = Claude is working again → delete entry, `cmux notify` success.
+   session's transcript JSONL contains a new **assistant** message stamped
+   after the nudge. Plain file growth is not proof — the TUI logs the user
+   message to the transcript *before* the API call, so a nudge that lands
+   while the limit is still active grows the file and then fails. An
+   assistant entry = Claude is actually working again → delete entry,
+   `cmux notify` success.
 4. No growth, or the limit banner is back → `attempts += 1`,
    `next_attempt_at = now + 10min`. At `attempts == 3` → delete entry,
    `cmux notify` + `osascript` macOS notification: gave up, resume manually.
@@ -165,8 +181,12 @@ worked*. That keeps the fragile part (TUI text matching) low-stakes.
 
 1. Unix epoch after a `|` or standing alone (10-digit int in a sane range).
 2. ISO-8601 timestamp anywhere in the text.
-3. Prose: `reset(s)? at <h>(:<mm>)?\s*(am|pm) (\(<tz>\))?` — resolved to the
-   next future occurrence in the given (or local) timezone.
+3. Prose time: `reset(s)? at <h>(:<mm>)?\s*(am|pm) (\(<tz>\))?` — resolved
+   to the next future occurrence in the given (or local) timezone
+   (`zoneinfo` from the stdlib).
+4. Prose day: a weekday name ("resets Thursday at 9am") — weekly-limit
+   messages point days ahead; without this case they'd fall into a +5h
+   ladder that can never succeed.
 
 Returns `None` rather than guessing; `None` engages the fallback ladder.
 Built against captured fixtures (Phase 0), which live in `tests/fixtures/`.
@@ -221,8 +241,14 @@ Stdlib `unittest`, no test deps. The seams:
 
 - **Phase 0 — recon (blocking):** verify `StopFailure` exists and fires on
   the installed Claude Code version; install a log-everything hook, capture a
-  real rate-limit payload, commit it (redacted) as a fixture. The parser and
-  entry schema get locked to reality here.
+  real rate-limit payload, commit it (redacted) as a fixture. Also verify a
+  detached process spawned from inside a pane keeps cmux socket access over
+  hours — and whether it survives a cmux app restart (if access is
+  token-based and the token rotates, the waiter needs a documented
+  fallback: `CMUX_SOCKET_MODE=allowAll`). Capture real `read-screen` output
+  for both pane states (Claude REPL alive vs shell prompt after exit) as
+  fixtures for the nudge classifier. The parser and entry schema get locked
+  to reality here.
 - **Phase 1:** parser + state ops (TDD).
 - **Phase 2:** hooks + install/uninstall.
 - **Phase 3:** waiter + nudge + verification.
@@ -230,6 +256,9 @@ Stdlib `unittest`, no test deps. The seams:
 
 ## Out of scope (v1)
 
+- A lifetime cap on resumes per job (a job that needs four windows gets
+  resumed four times — that's the point; per-resume notifications keep the
+  user informed if something runs away).
 - Non-cmux sessions (plain terminals, IDE panes) — notify only.
 - Headless `claude -p` wrapper mode.
 - Power management.
